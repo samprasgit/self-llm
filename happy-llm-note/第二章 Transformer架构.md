@@ -87,26 +87,121 @@ def attention(query, key, value, mask=None, dropout=None):
 ### 3.1 工作原理
 
 自注意力机制是Transformer的核心创新，其特点是Q、K、V都来自同一个输入序列。这使得序列中的每个token都能感知到序列中所有其他token的信息，从而捕捉内部结构和长距离依赖关系。
+在Encoder中Q、K、V分别是输入对参数矩阵 $W_q$、$W_k$、$W_v$ 做乘积得到，从何拟合输入语句中每一个token对其他所有的token的关系
 
-### 3.2 计算过程
+### 3.2 掩码自注意力机制   Mask Self-Attention
 
-1. **输入处理**：对于输入序列X，通过线性变换生成Q、K、V矩阵
-   - Q = XW_Q
-   - K = XW_K  
-   - V = XW_V
+掩码自注意力，即 Mask Self-Attention，是指使用注意力掩码的自注意力机制。掩码的作用是遮蔽一些特定位置的 token，模型在学习的过程中，会忽略掉被遮蔽的 token。
 
-2. **注意力得分计算**：
-   - 计算Q和K的点积：QK^T
-   - 缩放：QK^T/√d_k
-   - 应用softmax：softmax(QK^T/√d_k)
+使用注意力掩码的核心动机是让模型只能使用历史信息进行预测而不能看到未来信息。使用注意力机制的 Transformer 模型也是通过类似于 n-gram 的语言模型任务来学习的，也就是对一个文本序列，不断根据之前的 token 来预测下一个 token，直到将整个文本序列补全。
 
-3. **输出生成**：加权求和得到最终输出
+例如，如果待学习的文本序列是 【BOS】I like you【EOS】，那么，模型会按如下顺序进行预测和学习：
 
-### 3.3 优势特点
+```plaintext
+Step 1：输入 【BOS】，输出 I
+Step 2：输入 【BOS】I，输出 like
+Step 3：输入 【BOS】I like，输出 you
+Step 4：输入 【BOS】I like you，输出 【EOS】
+```
 
-- **全局信息获取**：每个位置都能直接访问序列中所有位置的信息
-- **并行计算**：所有位置可以同时计算，提高效率
-- **灵活的依赖建模**：能够学习任意距离的依赖关系
+理论上来说，只要学习的语料足够多，通过上述的过程，模型可以学会任意一种文本序列的建模方式，也就是可以对任意的文本进行补全。
+
+但是，我们可以发现，上述过程是一个串行的过程，也就是需要先完成 Step 1，才能做 Step 2，接下来逐步完成整个序列的补全。我们在一开始就说过，Transformer 相对于 RNN 的核心优势之一即在于其可以并行计算，具有更高的计算效率。如果对于每一个训练语料，模型都需要串行完成上述过程才能完成学习，那么很明显没有做到并行计算，计算效率很低。
+
+针对这个问题，Transformer 就提出了掩码自注意力的方法。掩码自注意力会生成一串掩码，来遮蔽未来信息。例如，我们待学习的文本序列仍然是 【BOS】I like you【EOS】，我们使用的注意力掩码是【MASK】，那么模型的输入为：
+
+```
+<BOS> 【MASK】【MASK】【MASK】【MASK】
+<BOS>    I   【MASK】 【MASK】【MASK】
+<BOS>    I     like  【MASK】【MASK】
+<BOS>    I     like    you  【MASK】
+<BOS>    I     like    you   </EOS>
+```
+
+在每一行输入中，模型仍然是只看到前面的 token，预测下一个 token。但是注意，上述输入不再是串行的过程，而可以一起并行地输入到模型中，模型只需要每一个样本根据未被遮蔽的 token 来预测下一个 token 即可，从而实现了并行的语言模型。
+
+观察上述的掩码，我们可以发现其实则是一个和文本序列等长的上三角矩阵。我们可以简单地通过创建一个和输入同等长度的上三角矩阵作为注意力掩码，再使用掩码来遮蔽掉输入即可。也就是说，当输入维度为 （batch_size, seq_len, hidden_size）时，我们的 Mask 矩阵维度一般为 (1, seq_len, seq_len)（通过广播实现同一个 batch 中不同样本的计算）。
+
+在具体实现中，我们通过以下代码生成 Mask 矩阵：
+
+```python
+# 创建一个上三角矩阵，用于遮蔽未来信息。
+# 先通过 full 函数创建一个 1 * seq_len * seq_len 的矩阵
+mask = torch.full((1, args.max_seq_len, args.max_seq_len), float("-inf"))
+# triu 函数的功能是创建一个上三角矩阵
+mask = torch.triu(mask, diagonal=1)
+```
+
+生成的 Mask 矩阵会是一个上三角矩阵，上三角位置的元素均为 -inf，其他位置的元素置为0。
+
+在注意力计算时，我们会将计算得到的注意力分数与这个掩码做和，再进行 Softmax 操作：
+
+```python
+# 此处的 scores 为计算得到的注意力分数，mask 为上文生成的掩码矩阵
+scores = scores + mask[:, :seqlen, :seqlen]
+scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+```
+
+通过做求和，上三角区域（也就是应该被遮蔽的 token 对应的位置）的注意力分数结果都变成了 `-inf`，而下三角区域的分数不变。再做 Softmax 操作，`-inf` 的值在经过 Softmax 之后会被置为 0，从而忽略了上三角区域计算的注意力分数，从而实现了注意力遮蔽。
+
+#### 2.4 Self-Attention实现   
+```python
+class SelfAttention(nn.Module):
+    """自注意力机制实现"""
+    
+    def __init__(self, d_model, dropout=0.1):
+        super(SelfAttention, self).__init__()
+        self.d_model = d_model
+        
+        # Q, K, V 线性变换层
+        self.query = nn.Linear(d_model, d_model)
+        self.key = nn.Linear(d_model, d_model)
+        self.value = nn.Linear(d_model, d_model)
+        
+        # 输出线性变换层
+        self.out = nn.Linear(d_model, d_model)
+        
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x, mask=None):
+        """
+        前向传播
+        Args:
+            x: 输入张量 (batch_size, seq_len, d_model)
+            mask: 注意力掩码 (batch_size, seq_len, seq_len)
+        Returns:
+            output: 输出张量 (batch_size, seq_len, d_model)
+            attention_weights: 注意力权重 (batch_size, seq_len, seq_len)
+        """
+        batch_size, seq_len, d_model = x.size()
+        
+        # 计算 Q, K, V
+        Q = self.query(x)  # (batch_size, seq_len, d_model)
+        K = self.key(x)    # (batch_size, seq_len, d_model)
+        V = self.value(x)  # (batch_size, seq_len, d_model)
+        
+        # 计算注意力分数 Q * K^T / sqrt(d_k)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.d_model)
+        
+        # 应用掩码（如果提供）
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+        
+        # 计算注意力权重（softmax）
+        attention_weights = F.softmax(scores, dim=-1)
+        
+        # 应用dropout
+        attention_weights = self.dropout(attention_weights)
+        
+        # 计算注意力输出
+        attn_output = torch.matmul(attention_weights, V)
+        
+        # 输出线性变换
+        output = self.out(attn_output)
+        
+        return output, attention_weights
+```
 
 ## 4. 多头注意力 (Multi-Head Attention)
 
