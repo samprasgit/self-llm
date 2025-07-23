@@ -563,6 +563,21 @@ class EncoderLayer(nn.Module):
         # 经过前馈神经网络
         out = h + self.feed_forward.forward(self.fnn_norm(h))
         return out
+        
+        
+class Encoder(nn.Module):
+    '''Encoder 块'''
+    def __init__(self, args):
+        super(Encoder, self).__init__() 
+        # 一个 Encoder 由 N 个 Encoder Layer 组成
+        self.layers = nn.ModuleList([EncoderLayer(args) for _ in range(args.n_layer)])
+        self.norm = LayerNorm(args.n_embd)
+
+    def forward(self, x):
+        "分别通过 N 层 Encoder Layer"
+        for layer in self.layers:
+            x = layer(x)
+        return self.norm(x)
 ```
 
 ## 6. Transformer架构组件
